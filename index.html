@@ -234,7 +234,7 @@ h3.sub{font-size:13px;color:var(--mut);margin:18px 0 8px;letter-spacing:.4px}
 <div class="card sec-gap">
   <h2><span class="dot" style="background:var(--grn);box-shadow:0 0 10px var(--grn)"></span>Dollar-Based Backtest & Auto-Calibration</h2>
   <div class="body">
-    <div class="muted" id="btIntro" style="margin-bottom:14px">Simulates a real account over <b>~5 years of live ETH/USDT data</b>: <b>initial capital</b>, fixed <b>% risk per trade</b> for position sizing, <b>partial exits</b> at TP1/TP2/TP3, real <b>Delta Exchange ETH-futures fees</b> (maker/taker + 18% GST), leverage cap and trade style. Auto-calibration optimises the signal parameters on the first 70% of history and <b>validates them out-of-sample</b> on the unseen last 30% to expose overfitting. (Order-book module is live-only, excluded from the backtest.)</div>
+    <div class="muted" id="btIntro" style="margin-bottom:14px">Simulates a real account over <b>~5 years of live ETH/USDT data on every timeframe</b> (Swing 1D, Intraday 4H, Scalp 1H — all paginated to the full window): <b>initial capital</b>, fixed <b>% risk per trade</b> for position sizing, <b>partial exits</b> at TP1/TP2/TP3, real <b>Delta Exchange ETH-futures fees</b> (maker/taker + 18% GST), leverage cap and trade style. Auto-calibration optimises on the first 70% of history and <b>validates out-of-sample</b> on the unseen last 30% to expose overfitting; the final result is reported over the full 5 years. (On large intraday/scalp sets the parameter sweep uses a recent window for speed; order-book module is live-only, excluded from the backtest.)</div>
 
     <!-- money-management controls -->
     <div class="mm-grid">

@@ -40,10 +40,15 @@ function dedupeSort(rows) {
 /* Timeframe profiles: which native interval to fetch + how to build HTF/MTF/LTF.
    sec = seconds per base candle, htf/mtf = resample factors for confluence,
    warmup/fwdMax tune the backtest, tvInterval for the chart. */
+// All profiles load ~5 years of live data. `lookback` bounds the per-bar
+// analysis window (keeps the backtest O(n) on large intraday sets) and must be
+// ≥ 200×htf so the EMA200 macro filter is available. `maxCalibBars` caps the
+// most-recent window used for the parameter sweep so calibration stays
+// responsive in the browser (the final reported backtest still uses full data).
 const PROFILES = {
-  swing:    { label: 'Swing · 1D',    binance: '1d',  delta: '1d',  cbGran: 86400, sec: 86400, htf: 5, mtf: 2, warmup: 210, fwdMax: 30, bars: 1830, tvInterval: 'D',   note: '1W·2D·1D' },
-  intraday: { label: 'Intraday · 4H', binance: '4h',  delta: '4h',  cbGran: 14400, sec: 14400, htf: 6, mtf: 2, warmup: 220, fwdMax: 36, bars: 1000, tvInterval: '240', note: '1D·8H·4H' },
-  scalp:    { label: 'Scalp · 1H',    binance: '1h',  delta: '1h',  cbGran: 3600,  sec: 3600,  htf: 4, mtf: 2, warmup: 220, fwdMax: 48, bars: 1000, tvInterval: '60',  note: '4H·2H·1H' }
+  swing:    { label: 'Swing · 1D',    binance: '1d',  delta: '1d',  cbGran: 86400, sec: 86400, htf: 5, mtf: 2, warmup: 210, fwdMax: 30, bars: 1830,  lookback: 1100, maxCalibBars: Infinity, tvInterval: 'D',   note: '1W·2D·1D' },
+  intraday: { label: 'Intraday · 4H', binance: '4h',  delta: '4h',  cbGran: 14400, sec: 14400, htf: 6, mtf: 2, warmup: 220, fwdMax: 36, bars: 10950, lookback: 1300, maxCalibBars: 6000, tvInterval: '240', note: '1D·8H·4H' },
+  scalp:    { label: 'Scalp · 1H',    binance: '1h',  delta: '1h',  cbGran: 3600,  sec: 3600,  htf: 4, mtf: 2, warmup: 220, fwdMax: 48, bars: 43800, lookback: 1000, maxCalibBars: 6000, tvInterval: '60',  note: '4H·2H·1H' }
 };
 function activeProfile() { return PROFILES[($('#profile') && $('#profile').value) || 'swing'] || PROFILES.swing; }
 
@@ -75,17 +80,32 @@ async function fetchBinance(prof) {
 }
 
 // Delta Exchange candles: result:[{time(sec),open,high,low,close,volume}]
+// Delta caps each call at ~4000 candles; paginate forward for large windows.
 async function fetchDelta(prof) {
-  const end = Math.floor(Date.now() / 1000);
-  const start = end - prof.bars * prof.sec;
-  const url = `https://api.delta.exchange/v2/history/candles?resolution=${prof.delta}&symbol=ETHUSDT&start=${start}&end=${end}`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error('Delta HTTP ' + res.status);
-  const j = await res.json();
-  if (!j.success || !j.result || !j.result.length) throw new Error('Delta: empty response');
-  return dedupeSort(j.result.map(r => ({
-    t: r.time, o: +r.open, h: +r.high, l: +r.low, c: +r.close, v: +r.volume
-  })));
+  const now = Math.floor(Date.now() / 1000);
+  const startAll = now - prof.bars * prof.sec;
+  const pageSpan = 4000 * prof.sec;
+  let cursor = startAll, all = [], guard = 0;
+  while (cursor < now && guard < 40) {
+    const end = Math.min(now, cursor + pageSpan);
+    const url = `https://api.delta.exchange/v2/history/candles?resolution=${prof.delta}&symbol=ETHUSDT&start=${cursor}&end=${end}`;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error('Delta HTTP ' + res.status);
+    const j = await res.json();
+    const rows = (j && j.result) ? j.result : [];
+    if (rows.length) {
+      all = all.concat(rows.map(r => ({ t: r.time, o: +r.open, h: +r.high, l: +r.low, c: +r.close, v: +r.volume })));
+      const maxT = rows.reduce((m, r) => Math.max(m, r.time), 0);
+      cursor = Math.max(maxT + prof.sec, end); // advance past last candle (or window)
+    } else {
+      if (end >= now) break;
+      cursor = end; // skip empty (pre-listing) window
+    }
+    guard++;
+    await new Promise(r => setTimeout(r, 140));
+  }
+  if (!all.length) throw new Error('Delta: empty response');
+  return dedupeSort(all);
 }
 
 // Coinbase ETH-USD candles (chunked ≤300): [time,low,high,open,close,vol]
@@ -609,6 +629,7 @@ function readMM(prof) {
   const num = (id, d) => { const v = parseFloat(($('#' + id) || {}).value); return isFinite(v) ? v : d; };
   return {
     htf: prof.htf, mtf: prof.mtf, warmup: prof.warmup,
+    lookback: prof.lookback, maxCalibBars: prof.maxCalibBars,
     capital: num('mmCapital', 10000),
     riskPct: num('mmRisk', 1),
     maxLeverage: num('mmLev', 25),
@@ -627,7 +648,10 @@ async function runCalibration() {
   if (!STATE.daily) { setStatus('Run the analysis first to load data.', false); return; }
   const btn = $('#calibBtn');
   btn.disabled = true;
-  setStatus('Sweeping strategy parameters with your money-management settings…', true);
+  const big = STATE.daily.length > 4000;
+  setStatus(big
+    ? `Sweeping parameters over ${STATE.daily.length.toLocaleString()} candles — large intraday set, this can take 1–2 minutes…`
+    : 'Sweeping strategy parameters with your money-management settings…', true);
   $('#calibChips').innerHTML = '<div class="cchip">Calibrating… <b id="cprog">0%</b></div>';
   await new Promise(r => setTimeout(r, 50));
 

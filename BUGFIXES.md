@@ -1,5 +1,63 @@
 # Bug-fix log
 
+## Round 7 — robustness audit (edge-case fuzzing)
+Fuzzed the recently-added calibration/lookback paths and analysis modules with
+boundary inputs. Bugs found & fixed:
+
+1. **🔴 `tetherDom` crash on bad data.** It checked `usdtSeries.length >= 8` but
+   not the *values*; a single `undefined`/`NaN`/zero in the series threw
+   `Cannot read properties of undefined (reading 'toFixed')`, killing the whole
+   signal. **Fix:** coerce to number and guard `isFinite` / non-zero baseline →
+   returns a neutral "Data unavailable" instead of crashing. (Also fixed an
+   inconsistent label.)
+
+2. **🟠 Calibration could run O(n²) if caller omitted `lookback`.** The bounded-
+   lookback optimisation only applied when the caller passed `lookback`; calling
+   `calibrate` with just `maxCalibBars` (or nothing) re-introduced the O(n²)
+   slowdown. **Fix:** `calibrate` now auto-defaults a safe `lookback`
+   (≥ 200×htf, covering EMA200) for every internal backtest. Verified identical
+   results to an explicit equal lookback.
+
+3. **🟠 `maxCalibBars` below `warmup` produced an empty sweep.** A tiny
+   `maxCalibBars` (e.g. 100 < warmup 210) left the parameter sweep with no
+   tradable bars while the reported stats silently came from the full run.
+   **Fix:** floor `maxCalibBars` at `warmup + 300` so the sweep always sees a
+   real trade sample.
+
+Verified non-bugs: live full-history signal == lookback-window signal (identical
+side/net/levels), 44k-bar `buildSignal` stays finite & fast (0.45s), all swing/
+FVG/OB indices stay in-bounds, app.js loads with no top-level errors.
+
+## Round 6 — 5-year depth on intraday/scalp + O(n²) performance bug
+Extending 5-year history to the 4H and 1H profiles surfaced a critical
+performance bug and required data-fetch + calibration changes.
+
+1. **🔴 O(n²) backtest loop.** The walk-forward did `daily.slice(0, i+1)` and
+   re-`resample()`/re-analysed the *entire* history at every bar. Fine for ~1,800
+   daily candles, but a 4H/5-year set (~11k candles) took **23s per backtest**
+   and 1H (~44k) was unusable. **Fix:** a bounded **rolling-lookback window**
+   (`opts.lookback`, ≥ 200×htf) makes each iteration O(1) → O(n) overall. Proven
+   **loss-less** (identical trades/equity vs full history). 4H single backtest:
+   23s → ~3s.
+
+2. **🔴 Delta 4000-candle cap (silent truncation).** Like the earlier Binance
+   bug, Delta returns only the most-recent ~4000 candles when over-requested, so
+   intraday windows were silently truncated. **Fix:** the Delta fetcher now
+   **paginates** forward in ≤4000-candle pages (verified: 10,950 4h / 43,800 1h
+   candles, both ends correct, back to 2021).
+
+3. **🟠 Calibration too slow for large sets.** Even at O(n), a 216-cell grid over
+   44k candles would take many minutes. **Fix:** calibration auto-selects a
+   **coarse 36-cell grid** for >4000-bar datasets and sweeps a capped recent
+   window (`maxCalibBars`, default 6000) for speed, while the **final reported
+   backtest + out-of-sample check still cover the full 5 years**. 4H/1H
+   calibration now completes in ~1.5 min.
+
+Note: out-of-sample validation now honestly shows the price-action strategy
+**does not generalise to 4H/1H** with current defaults (OOS PF < 1), whereas it
+holds up on the daily timeframe. That transparency is by design.
+
+
 ## Round 5 — 5-year backtest audit
 Extended the swing backtest window to ~5 years (1830 daily candles) and audited
 the analysis + backtest engine against the longer history.

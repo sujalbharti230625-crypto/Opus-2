@@ -495,9 +495,13 @@ function elliott(c) {
    usdtPrev/usdtNow: USDT.D %, plus short trend. Falling USDT.D => bullish ETH */
 function tetherDom(usdtSeries) {
   // usdtSeries: array of dominance % (chronological). use last vs ~7 ago
-  if (!usdtSeries || usdtSeries.length < 8) return { score: 0, label: 'Tether Dominance', detail: 'Data unavailable', value: null };
-  const now = usdtSeries[usdtSeries.length - 1];
-  const prev = usdtSeries[usdtSeries.length - 8];
+  if (!Array.isArray(usdtSeries) || usdtSeries.length < 8) return { score: 0, label: 'Tether Dominance (inverse)', detail: 'Data unavailable', value: null };
+  const now = +usdtSeries[usdtSeries.length - 1];
+  const prev = +usdtSeries[usdtSeries.length - 8];
+  // guard against undefined/NaN/zero values in the series (avoids crashes)
+  if (!isFinite(now) || !isFinite(prev) || prev === 0) {
+    return { score: 0, label: 'Tether Dominance (inverse)', detail: 'Data unavailable', value: isFinite(now) ? now : null };
+  }
   const chg = (now - prev) / prev;
   let score = 0, detail;
   if (chg < -0.01) { score = 0.6; detail = `USDT.D falling ${(chg * 100).toFixed(2)}% → risk-on, bullish ETH`; }
@@ -676,14 +680,20 @@ function backtest(daily, usdtAligned, params, opts) {
   const trades = [];
   let equity = capital;
   let lastExitIdx = -999;
+  // Performance: bound the per-bar analysis to a rolling lookback window so the
+  // backtest is O(n·W) instead of O(n²). Every module only needs recent bars
+  // (EMAs ≤200, swings/zones/FVGs ≤~180), so a window of a few hundred LTF bars
+  // is loss-less in practice. Default Infinity keeps legacy (daily) behaviour.
+  const lookback = opts.lookback || Infinity;
 
   for (let i = warmup; i < daily.length - 1; i++) {
     if (i - lastExitIdx < cooldownBars) continue;
     if (equity <= 0) break; // account blown
-    const upto = daily.slice(0, i + 1);
+    const from = isFinite(lookback) ? Math.max(0, i + 1 - lookback) : 0;
+    const upto = daily.slice(from, i + 1);
     const tfData = { high: resample(upto, htf), mid: resample(upto, mtf), low: upto };
     if (tfData.high.length < 60) continue;
-    const us = usdtAligned ? usdtAligned.slice(0, i + 1) : null;
+    const us = usdtAligned ? usdtAligned.slice(from, i + 1) : null;
     let sig;
     try { sig = buildSignal(tfData, us, p); } catch (e) { continue; }
     if (sig.side === 'NEUTRAL' || !isFinite(sig.stop)) continue;
@@ -847,21 +857,54 @@ function score(s) {
 
 function calibrate(daily, usdtAligned, onProgress, opts) {
   opts = opts || {};
-  const grid = {
+  // Full grid (216 cells) for small datasets; a coarse grid (48 cells) for large
+  // intraday/scalp datasets so calibration stays responsive in the browser.
+  const fullGrid = {
     threshold: [0.08, 0.12, 0.16, 0.20],
     slMult: [1.0, 1.5, 2.0],
     t2R: [2.0, 2.5, 3.0],
     tether: [0.5, 1.2],
-    priceAction: [1.6, 2.2, 3.0] // sweep the price-action emphasis itself
+    priceAction: [1.6, 2.2, 3.0]
   };
+  const coarseGrid = {
+    threshold: [0.10, 0.16, 0.22],
+    slMult: [1.0, 2.0],
+    t2R: [2.0, 3.0],
+    tether: [0.8],
+    priceAction: [1.6, 2.2, 3.0]
+  };
+  const grid = opts.grid === 'coarse' ? coarseGrid
+    : opts.grid === 'full' ? fullGrid
+    : (daily.length > 4000 ? coarseGrid : fullGrid); // auto by size
   // Walk-forward / out-of-sample validation to fight overfitting:
   // optimise params on the first `trainFrac` of history, then re-score the
   // winner on the held-out remainder. Disable with opts.validate=false.
-  const validate = opts.validate !== false && daily.length > 400;
+  // For very large intraday/scalp datasets, sweep parameters on a capped window
+  // of the MOST RECENT bars (responsiveness), while the final reported backtest
+  // + out-of-sample check still run on the FULL history below.
+  const warmup = opts.warmup || 210;
+  // Auto-default a rolling lookback so calibration is never accidentally O(n²)
+  // on large data, even if the caller forgot to pass one. Must comfortably
+  // cover EMA200 on the HTF (≈200×htf) plus warmup headroom.
+  const htfForLb = opts.htf || 5;
+  const safeOpts = Object.assign({}, opts);
+  if (!isFinite(safeOpts.lookback) || safeOpts.lookback == null) {
+    safeOpts.lookback = Math.max(1100, 200 * htfForLb + 100, warmup + 200);
+  }
+  // Cap the sweep to the most-recent window for speed; never below a usable
+  // minimum (warmup + a meaningful trade sample), else the sweep sees no trades.
+  let maxCalibBars = opts.maxCalibBars || Infinity;
+  if (isFinite(maxCalibBars)) maxCalibBars = Math.max(maxCalibBars, warmup + 300);
+  const sweepData = isFinite(maxCalibBars) && daily.length > maxCalibBars
+    ? daily.slice(daily.length - maxCalibBars) : daily;
+  const sweepUsdt = (usdtAligned && sweepData !== daily)
+    ? usdtAligned.slice(usdtAligned.length - sweepData.length) : usdtAligned;
+
+  const validate = opts.validate !== false && sweepData.length > 400;
   const trainFrac = opts.trainFrac || 0.7;
-  const splitIdx = validate ? Math.floor(daily.length * trainFrac) : daily.length;
-  const trainData = daily.slice(0, splitIdx);
-  const trainUsdt = usdtAligned ? usdtAligned.slice(0, splitIdx) : null;
+  const splitIdx = validate ? Math.floor(sweepData.length * trainFrac) : sweepData.length;
+  const trainData = sweepData.slice(0, splitIdx);
+  const trainUsdt = sweepUsdt ? sweepUsdt.slice(0, splitIdx) : null;
 
   let best = null, tested = 0;
   const total = grid.threshold.length * grid.slMult.length * grid.t2R.length * grid.tether.length * grid.priceAction.length;
@@ -872,7 +915,7 @@ function calibrate(daily, usdtAligned, onProgress, opts) {
         for (const tether of grid.tether)
         for (const priceAction of grid.priceAction) {
           const params = { threshold, slMult, t2R, t1R: Math.max(1, t2R - 1), t3R: t2R + 1.5, tether, priceAction };
-          const bt = backtest(trainData, trainUsdt, params, opts);
+          const bt = backtest(trainData, trainUsdt, params, safeOpts);
           const obj = score(bt.stats);
           results.push({ params, stats: bt.stats, obj });
           if (!best || obj > best.obj) best = { params, stats: bt.stats, obj, bt };
@@ -882,16 +925,18 @@ function calibrate(daily, usdtAligned, onProgress, opts) {
   if (!best) return { best: null, results };
 
   // Re-run the winning params over the FULL history for the reported result,
-  // and compute an out-of-sample (held-out) check for honesty.
-  const full = backtest(daily, usdtAligned, best.params, opts);
+  // and compute an out-of-sample (held-out) check on the sweep window.
+  const full = backtest(daily, usdtAligned, best.params, safeOpts);
   let oos = null;
   if (validate) {
-    const testData = daily.slice(splitIdx - (opts.warmup || 210)); // keep warmup context
-    const testUsdt = usdtAligned ? usdtAligned.slice(splitIdx - (opts.warmup || 210)) : null;
-    oos = backtest(testData, testUsdt, best.params, opts).stats;
+    const ctx = (opts.warmup || 210);
+    const testData = sweepData.slice(Math.max(0, splitIdx - ctx)); // keep warmup context
+    const testUsdt = sweepUsdt ? sweepUsdt.slice(Math.max(0, splitIdx - ctx)) : null;
+    oos = backtest(testData, testUsdt, best.params, safeOpts).stats;
   }
   best = { params: best.params, stats: full.stats, bt: full, obj: best.obj,
-           inSample: best.stats, outOfSample: oos, validated: validate, splitIdx };
+           inSample: best.stats, outOfSample: oos, validated: validate,
+           splitIdx, sweepBars: sweepData.length, fullBars: daily.length };
   return { best, results };
 }
 

@@ -129,6 +129,11 @@ section('Module directionality');
   ok(E.tetherDom(rising).score < 0, 'tetherDom: rising USDT.D bearish');
   eq(E.tetherDom(null).score, 0, 'tetherDom: null → neutral');
   eq(E.tetherDom([1, 2]).score, 0, 'tetherDom: too short → neutral');
+  // hardening: undefined/NaN/zero values in a long-enough series must NOT crash
+  ok(E.tetherDom([undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined]).score === 0, 'tetherDom: undefined values → neutral (no crash)');
+  ok(E.tetherDom([5, 5, 5, 5, 5, 5, 5, NaN]).score === 0, 'tetherDom: trailing NaN → neutral (no crash)');
+  ok(E.tetherDom([0, 5, 5, 5, 5, 5, 5, 5]).score === 0, 'tetherDom: zero baseline → neutral (no div-by-zero)');
+  ok(E.tetherDom(['6', '5.9', '5.8', '5.7', '5.6', '5.5', '5.4', '5.3']).score > 0, 'tetherDom: numeric strings coerced → falling = bullish');
 })();
 
 section('Price Action module');
@@ -343,6 +348,44 @@ section('Backtest 5-year scale & same-bar ambiguity');
   const b2 = E.backtest(c, null, { threshold: 0.05 }, { capital: 10000, style: 'swing' });
   let overfill = 0; b2.trades.forEach(t => { const fq = t.fills.reduce((a, f) => a + f.qty, 0); if (fq - t.qty > 1e-6) overfill++; });
   eq(overfill, 0, 'no trade closes more than its position (no double-close on same-bar stop+TP)');
+})();
+
+section('Performance: rolling-lookback equivalence & large-data calibration');
+(() => {
+  // The bounded-lookback window must be loss-less vs full-history when it's
+  // large enough to cover EMA200 + module windows.
+  const d = randomWalk(900, 33);
+  const params = { threshold: 0.12, slMult: 1.5, t2R: 2.5, priceAction: 2.2, tether: 0.5 };
+  const full = E.backtest(d, null, params, { capital: 10000, style: 'swing' });
+  const lb = E.backtest(d, null, params, { capital: 10000, style: 'swing', lookback: 1100 });
+  eq(JSON.stringify(full.trades.map(t => t.idx)), JSON.stringify(lb.trades.map(t => t.idx)),
+    'lookback backtest produces identical trade entries to full-history');
+  ok(Math.abs(full.stats.finalEquity - lb.stats.finalEquity) < 1e-6, 'lookback equity matches full-history');
+
+  // Coarse grid for large datasets keeps calibration small.
+  const big = randomWalk(4200, 44);
+  const calAuto = E.calibrate(big, null, null, { capital: 10000, style: 'day', htf: 6, lookback: 1300, maxCalibBars: 2500 });
+  ok(calAuto.results.length === 36, 'auto-selects coarse 36-cell grid for >4000-bar datasets');
+  ok(calAuto.best.sweepBars <= 2500, 'calibration sweep window capped by maxCalibBars');
+  ok(calAuto.best.fullBars === big.length, 'full reported backtest still covers all bars');
+  finiteNum(calAuto.best.stats.finalEquity, 'large-data calibrated finalEquity finite');
+
+  // Explicit grid override still respected on small data.
+  const calCoarse = E.calibrate(randomWalk(600, 55), null, null, { grid: 'coarse' });
+  eq(calCoarse.results.length, 36, 'explicit coarse grid = 36 cells');
+
+  // Robustness: calibrate must auto-default a finite lookback so it is never
+  // accidentally O(n²). The auto value should match an explicit equal lookback
+  // (deterministic, environment-independent) — proving the default is applied.
+  const lbData = randomWalk(2500, 66);
+  const calAutoLb = E.calibrate(lbData, null, null, { maxCalibBars: 1500, grid: 'coarse' });
+  const calExplLb = E.calibrate(lbData, null, null, { maxCalibBars: 1500, grid: 'coarse', lookback: Math.max(1100, 200 * 5 + 100, 210 + 200) });
+  ok(calAutoLb.best && isFinite(calAutoLb.best.stats.finalEquity), 'auto-lookback calibrate produces finite result');
+  eq(JSON.stringify(calAutoLb.best.params), JSON.stringify(calExplLb.best.params), 'auto-default lookback matches explicit equal lookback (default applied)');
+
+  // maxCalibBars below warmup must be floored so the sweep sees real trades.
+  const calFloor = E.calibrate(randomWalk(2000, 77), null, null, { maxCalibBars: 50, warmup: 210 });
+  ok(calFloor.best.sweepBars >= 210 + 300, 'maxCalibBars floored above warmup+buffer');
 })();
 
 section('Adaptive long-EMA (works on short/resampled series)');

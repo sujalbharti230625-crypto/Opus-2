@@ -21,7 +21,7 @@ so the TradingView chart and live fetches only work in a real browser tab.)
 3. Set your **money-management** inputs (initial capital, % risk per trade,
    leverage cap, trade style, TP1/2/3 split, SL→breakeven, Delta fees), then
    click **⚙ Run Backtest & Calibrate** — walks the strategy forward over the
-   loaded history (~5 years of daily data on the Swing profile), sweeps the
+   loaded history (~5 years on EVERY timeframe — Swing 1D, Intraday 4H, Scalp 1H), sweeps the
    parameter grid, and applies the best set to the live signal.
 
 ### Dollar-based backtest
@@ -40,9 +40,19 @@ The simulator models a real account:
   (editable). Entry/stop/time exits = taker; TP limit fills = maker.
 - **Trade style** sets the max holding window & cooldown:
   Scalp (≤14 bars), Day (≤30), Swing (≤90).
-- Outputs: final equity, net profit, return %, CAGR, win rate, profit factor,
-  max drawdown (% and $), total fees paid, expectancy ($ and R), equity curve,
-  and a per-trade log (qty, TPs hit, exit reason, fees, net P&L, running equity).
+- **5-year depth on all timeframes:** Swing ≈ 1,830 daily, Intraday ≈ 10,950
+  4h, Scalp ≈ 43,800 1h candles — all paginated from the exchange to the full
+  window. Outputs: final equity, net profit, return %, CAGR, win rate, profit
+  factor, max drawdown (% and $), total fees paid, expectancy ($ and R), equity
+  curve, and a per-trade log (qty, TPs hit, exit reason, fees, net P&L, equity).
+
+### Performance design (intraday/scalp)
+The backtest uses a **bounded rolling-lookback window** so per-bar analysis is
+O(1) and the whole walk-forward is O(n) instead of O(n²) — verified loss-less
+vs full-history (identical trades). For large datasets the parameter sweep auto-
+switches to a **coarse 36-cell grid** and a capped recent window
+(`maxCalibBars`), while the final reported backtest + out-of-sample check still
+run over the full 5 years. (A 1h/5-year calibration is ~1–2 min in-browser.)
 
 ## Files
 | File | Purpose |
@@ -83,7 +93,7 @@ npm test            # unit tests + live API integration (needs internet)
 npm run test:offline   # unit tests only, no network
 ```
 Exit code is non-zero if any assertion fails (CI-friendly).
-Current suite: **122 checks** (107 offline unit + 15 live integration),
+Current suite: **136 checks** (121 offline unit + 15 live integration),
 including price-action module (FVG/sweep/premium-discount), CHoCH structure,
 dollar-model position sizing, leverage cap, fee scaling and partial exits.
 
